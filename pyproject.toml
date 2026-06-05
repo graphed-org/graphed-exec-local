@@ -23,6 +23,7 @@ dependencies = ["graphed-core", "graphed-debug", "graphed"]
 # the backends + corpus are only needed to exercise realistic HEP analyses end-to-end in the suite
 dev = [
   "pytest",
+  "pytest-cov",
   "pytest-xdist",
   "hypothesis",
   "mypy",
