@@ -6,10 +6,13 @@ that run a ``graphed_core.Plan`` to one reduced result via a deterministic, stra
 reduction, with ``open_once`` file-locality, stopping conditions, adaptive reshaping, and intact
 remote ``StageError`` surfacing (plan A.3 #8).
 
+Start with :doc:`design` for the engineering walkthrough.
+
 .. toctree::
    :maxdepth: 2
    :caption: Contents
 
+   design
    api
    improvements
 
