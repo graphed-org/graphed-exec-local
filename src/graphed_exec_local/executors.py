@@ -11,6 +11,7 @@ as-is, never degraded to an opaque string (plan A.3 #8).
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing
 import threading
 import time
@@ -82,16 +83,43 @@ class _BaseExecutor:
         *,
         on_combine: Callable[[int], None] | None = None,
         pooled_combines: bool = False,
+        persistent: bool = False,
     ):
         self.max_workers = max_workers
         self._on_combine = on_combine  # test hook: called per tree-reduce combine with #leaves so far
         self._pooled_combines = pooled_combines
+        # persistent=True keeps ONE pool across run() calls (amortizing the import-heavy spawn
+        # over many plans — notebooks, sweeps); the default stays a fresh pool per run.
+        self._persistent = persistent
+        self._kept_pool: _PoolExecutor | None = None
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
 
     def _entry(self) -> Callable[..., object]:
         raise NotImplementedError
+
+    @contextlib.contextmanager
+    def _acquired_pool(self) -> Iterator[_PoolExecutor]:
+        if not self._persistent:
+            with self._pool() as pool:
+                yield pool
+            return
+        if self._kept_pool is None:
+            self._kept_pool = self._pool()
+        yield self._kept_pool  # kept alive for the next run()
+
+    def close(self) -> None:
+        """Release a persistent pool (idempotent); a later run() lazily respawns."""
+        if self._kept_pool is not None:
+            self._kept_pool.shutdown(wait=True)
+            self._kept_pool = None
+
+    def __enter__(self) -> _BaseExecutor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def run(self, plan: Plan[R]) -> ExecResult[R]:
         if plan.next_tasks is not None:
@@ -114,7 +142,7 @@ class _BaseExecutor:
             waiting.setdefault(a, []).append(ci)
             waiting.setdefault(b, []).append(ci)
 
-        with self._pool() as pool:
+        with self._acquired_pool() as pool:
             node_of: dict[Future[object], int] = {
                 pool.submit(self._entry(), plan.process, t.partition): i for i, t in enumerate(tasks)
             }
@@ -146,7 +174,7 @@ class _BaseExecutor:
         n = len(tasks)
         if n == 0:
             return ExecResult(plan.empty(), 0, 0, StopReason.EXHAUSTED)
-        with self._pool() as pool:
+        with self._acquired_pool() as pool:
             leaf_of: dict[Future[object], int] = {
                 pool.submit(self._entry(), plan.process, t.partition): i for i, t in enumerate(tasks)
             }
@@ -169,7 +197,7 @@ class _BaseExecutor:
         stopped: StopReason | None = None
         next_tasks = plan.next_tasks
 
-        with self._pool() as pool:
+        with self._acquired_pool() as pool:
 
             def refill() -> None:
                 batch = next_tasks(ctx)  # DONE == None
