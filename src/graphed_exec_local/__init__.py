@@ -10,9 +10,10 @@ distributed adapter.
 
 from __future__ import annotations
 
+from graphed_core.execution import LocalResources
+
 from ._reduce import plan_tree, running_fold, tree_reduce
 from .executors import ProcessExecutor, ThreadExecutor
-from .resources import LocalResources
 
 __all__ = [
     "LocalResources",

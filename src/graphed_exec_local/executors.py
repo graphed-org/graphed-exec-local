@@ -18,6 +18,7 @@ import os
 import pickle
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -33,9 +34,9 @@ from concurrent.futures import (
 from typing import TypeVar, cast
 
 from graphed_core import ExecContext, ExecResult, Partition, Plan, StopReason
+from graphed_core.execution import LocalResources
 
 from ._reduce import plan_tree, running_fold, tree_reduce
-from .resources import LocalResources
 
 R = TypeVar("R")
 
@@ -47,7 +48,12 @@ _proc_resources: LocalResources | None = None
 # re-shipped on EVERY submit (concurrent.futures does not dedupe callables). Instead it is
 # broadcast to each worker ONCE, cached here by content hash, and tasks ship only (token,
 # partition). The cache is keyed by hash so re-running the same plan reuses the cached process.
-_shared_objects: dict[str, object] = {}
+# capacity of the per-worker shared-process cache AND the driver's broadcast-token set --
+# the SAME value on both sides, FIFO-evicted in broadcast order (identical across workers
+# because every worker receives the same broadcast sequence), so "the driver thinks token T
+# is primed" stays equivalent to "every worker has T".
+_SHARED_CACHE_CAP = 32
+_shared_objects: OrderedDict[str, object] = OrderedDict()
 
 
 def _thread_resources() -> LocalResources:
@@ -73,12 +79,15 @@ def _proc_task(process: Callable[[Partition, LocalResources], object], partition
 
 
 def _prime_shared(token: str, payload: bytes) -> int:
-    """Cache the broadcast process under ``token`` (idempotent); return this worker's pid so the
-    driver can confirm every worker has been primed. The brief hold makes a worker keep this
-    task long enough for its siblings to each claim one, so the driver's pid-coverage loop
-    completes in a single round rather than depending on scheduling luck."""
-    if token not in _shared_objects:
+    """Cache the broadcast process under ``token`` and return this worker's pid so the driver
+    can confirm coverage. Bounded FIFO (cap ``_SHARED_CACHE_CAP``), evicting the oldest
+    broadcast -- identical across workers because every worker sees the same broadcast order,
+    so it stays in lockstep with the driver's token set. The brief hold makes a worker keep
+    this task long enough for its siblings to each claim one (single-round coverage)."""
+    if token not in _shared_objects:  # idempotent: re-priming an existing token does not reorder
         _shared_objects[token] = pickle.loads(payload)
+        while len(_shared_objects) > _SHARED_CACHE_CAP:
+            _shared_objects.popitem(last=False)
     time.sleep(0.002)
     return os.getpid()
 
@@ -111,14 +120,16 @@ class _BaseExecutor:
         pooled_combines: bool = False,
         persistent: bool = False,
     ):
-        self.max_workers = max_workers
+        self.max_workers = max_workers if max_workers is not None else (os.cpu_count() or 1)
         self._on_combine = on_combine  # test hook: called per tree-reduce combine with #leaves so far
         self._pooled_combines = pooled_combines
         # persistent=True keeps ONE pool across run() calls (amortizing the import-heavy spawn
         # over many plans — notebooks, sweeps); the default stays a fresh pool per run.
         self._persistent = persistent
         self._kept_pool: _PoolExecutor | None = None
-        self._broadcast_tokens: set[str] = set()  # M31: which processes this pool already has
+        self._broadcast_tokens: OrderedDict[str, None] = (
+            OrderedDict()
+        )  # M31/M34: primed tokens, FIFO-bounded in lockstep with each worker cache
 
     def _pool(self) -> _PoolExecutor:
         raise NotImplementedError
@@ -133,12 +144,12 @@ class _BaseExecutor:
     @contextlib.contextmanager
     def _acquired_pool(self) -> Iterator[_PoolExecutor]:
         if not self._persistent:
-            self._broadcast_tokens = set()  # a fresh pool: nothing is primed yet
+            self._broadcast_tokens = OrderedDict()  # a fresh pool: nothing is primed yet
             with self._pool() as pool:
                 yield pool
             return
         if self._kept_pool is None:
-            self._broadcast_tokens = set()  # newly (re)spawned workers hold no cache
+            self._broadcast_tokens = OrderedDict()  # newly (re)spawned workers hold no cache
             self._kept_pool = self._pool()
         yield self._kept_pool  # kept alive for the next run()
 
@@ -147,7 +158,7 @@ class _BaseExecutor:
         if self._kept_pool is not None:
             self._kept_pool.shutdown(wait=True)
             self._kept_pool = None
-            self._broadcast_tokens = set()  # respawned workers will need re-priming
+            self._broadcast_tokens = OrderedDict()  # respawned workers will need re-priming
 
     def __enter__(self) -> _BaseExecutor:
         return self
@@ -299,12 +310,20 @@ class ProcessExecutor(_BaseExecutor):
         identity, so we submit priming tasks (each holds briefly, then returns its pid) until the
         set of pids covers the whole pool — the prime is idempotent, so extra hits are harmless."""
         if token in self._broadcast_tokens:
+            self._broadcast_tokens.move_to_end(token)  # idempotent; keep recency
             return
-        target = int(getattr(pool, "_max_workers", self.max_workers or 1))
+        target = self.max_workers  # concrete (resolved in __init__) -- no private pool attribute
         seen: set[int] = set()
         rounds = 0
         while len(seen) < target and rounds < 1000:
             batch = [pool.submit(_prime_shared, token, payload) for _ in range(target - len(seen))]
-            seen.update(f.result() for f in batch)
+            seen.update(f.result() for f in batch)  # a dead worker surfaces as BrokenProcessPool here
             rounds += 1
-        self._broadcast_tokens.add(token)
+        if len(seen) < target:  # never silently mark a token primed without full coverage (P1-3)
+            raise RuntimeError(
+                f"broadcast reached only {len(seen)}/{target} workers after {rounds} rounds; "
+                "refusing to cache an under-primed process (would KeyError on an unprimed worker)"
+            )
+        self._broadcast_tokens[token] = None
+        while len(self._broadcast_tokens) > _SHARED_CACHE_CAP:  # FIFO, lockstep with the workers
+            self._broadcast_tokens.popitem(last=False)

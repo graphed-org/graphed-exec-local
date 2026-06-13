@@ -44,7 +44,7 @@ packages = ["src/graphed_exec_local"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests/frozen/m7", "tests/frozen/m10", "tests/frozen/m31"]
+pythonpath = ["src", "tests/frozen/m7", "tests/frozen/m10", "tests/frozen/m31", "tests/frozen/m34"]
 addopts = "-q"
 
 [tool.coverage.run]
