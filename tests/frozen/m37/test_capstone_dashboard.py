@@ -1,13 +1,22 @@
 """M37 capstone (graphed-exec-local slice): a real ``ProcessExecutor`` run with a live ``Dashboard``
-attached — the cross-process plumbing end-to-end. Worker events forward over the side-queue to the
-driver-side collector; the statistical sampler's per-worker sessions merge into one flamegraph; and
-the reduced result is **unchanged** by the dashboard's presence.
+attached — the cross-process + network plumbing end-to-end. Worker events forward over the in-process
+side-queue to the driver collector, then over a **websocket** to the Perspective ``DashboardServer``;
+per-worker pyinstrument sessions ride the same path and the server flattens them into profile rows.
+The reduced result is **unchanged** by the dashboard's presence.
 
-graphed-debug is a runtime dependency of this package, so importing ``Dashboard`` here is in-deps
-(R13.8). pyinstrument is in the dev extra, so ``profile=True`` is exercised.
+graphed-debug is a runtime dependency of this package, so importing ``Dashboard`` is in-deps (R13.8);
+the dashboard *extra* (perspective/tornado/websocket) is gated with ``importorskip`` so a leg without
+those wheels (e.g. free-threaded 3.14t) skips this cleanly.
 """
 
 from __future__ import annotations
+
+import time
+
+import pytest
+
+pytest.importorskip("perspective")
+pytest.importorskip("websocket")
 
 from graphed_core import Partition, Plan, Task
 from graphed_debug import Dashboard
@@ -21,28 +30,26 @@ def _plan(n: int = 6) -> Plan[float]:
     return Plan(process=cpu_work, combine=addf, empty=lambda: 0.0, tasks=tasks)
 
 
-def test_process_executor_with_dashboard_is_passive_and_profiles() -> None:
+def test_process_executor_with_dashboard_over_the_network() -> None:
     plan = _plan(6)
     bare = ProcessExecutor(max_workers=2).run(plan).value
 
-    dash = Dashboard(profile=True)  # not start()ed: this exercises the Monitor + sampler plumbing
-    with ProcessExecutor(max_workers=2, monitor=dash, persistent=True) as ex:
-        observed = ex.run(plan).value
-    snap = dash.snapshot()
+    with Dashboard(profile=True) as dash:
+        with ProcessExecutor(max_workers=2, monitor=dash.monitor, persistent=True) as ex:
+            observed = ex.run(plan).value
+        snap = dash.wait_for(finished=6, timeout=30)
 
-    # passivity: the dashboard changed nothing
-    assert abs(observed - bare) < 1e-9
-    # the full event stream reached the driver across the process boundary
-    assert snap["counters"]["submitted"] == 6
-    assert snap["counters"]["finished"] == 6
-    assert snap["counters"]["errored"] == 0
-    assert snap["inflight"] == 0
-    worker_pids = [w for w in snap["workers"] if w != "driver"]
-    assert len(worker_pids) >= 1  # >=1 worker process observed
+        # passivity: streaming over the websocket changed nothing
+        assert abs(observed - bare) < 1e-9
+        # the full event stream crossed process boundary + network to the Perspective server
+        assert snap["stats"]["submitted"] == 6
+        assert snap["stats"]["finished"] == 6
+        assert snap["stats"]["errored"] == 0
+        assert snap["stats"]["inflight"] == 0
 
-    # the flamegraph is a well-formed {name,value,children} tree
-    flame = snap["flame"]
-    assert set(flame) == {"name", "value", "children"}
-    if snap["profile"]:  # pyinstrument installed -> a non-empty merged profile arrived
-        assert flame["children"], "profiling produced no frames despite heavy worker work"
-        assert flame["value"] > 0
+        # profiling sessions traversed the same transport and became profile rows (statistical, so
+        # poll briefly; the work is heavy enough to reliably sample)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and dash.snapshot()["profile_rows"] == 0:
+            time.sleep(0.05)
+        assert dash.snapshot()["profile_rows"] > 0
